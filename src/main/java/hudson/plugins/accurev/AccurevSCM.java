@@ -1,19 +1,26 @@
 package hudson.plugins.accurev;
 
-import hudson.EnvVars;
-import hudson.Extension;
-import hudson.FilePath;
-import hudson.Launcher;
+import com.cloudbees.plugins.credentials.CredentialsMatchers;
+import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
+import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
+import com.cloudbees.plugins.credentials.domains.DomainRequirement;
+import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
+import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
+import hudson.*;
 import hudson.model.*;
 import hudson.plugins.accurev.cmd.Login;
 import hudson.plugins.accurev.cmd.ShowDepots;
 import hudson.plugins.accurev.cmd.ShowStreams;
 import hudson.plugins.accurev.delegates.AbstractModeDelegate;
-import hudson.plugins.jetty.security.Password;
 import hudson.scm.*;
+import hudson.security.ACL;
 import hudson.util.ComboBoxModel;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
+import hudson.util.Secret;
 import jenkins.model.Jenkins;
 import jenkins.plugins.accurev.AccurevTool;
 import jenkins.plugins.accurev.util.UUIDUtils;
@@ -29,6 +36,7 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -567,9 +575,7 @@ public class AccurevSCM extends SCM {
          */
         @Override
         public String getDisplayName() {
-
             return "AccuRev";
-
         }
 
         public boolean showAccurevToolOptions() {
@@ -594,6 +600,21 @@ public class AccurevSCM extends SCM {
                 r.add(accurev.getName());
             }
             return r;
+        }
+
+        @SuppressWarnings("unused")
+        public ListBoxModel doFillCredentialsIdItems(@QueryParameter String host, @QueryParameter int port, @QueryParameter String credentialsId) {
+            if (!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER)) {
+                return new StandardListBoxModel().includeCurrentValue(credentialsId);
+            }
+            return new StandardListBoxModel()
+                    .includeEmptyValue()
+                    .includeMatchingAs(ACL.SYSTEM,
+                            Jenkins.getInstance(),
+                            StandardUsernamePasswordCredentials.class,
+                            URIRequirementBuilder.fromUri("").withHostnamePort(host, port).build(),
+                            CredentialsMatchers.always()
+                    );
         }
 
         /**
@@ -657,6 +678,7 @@ public class AccurevSCM extends SCM {
          *
          * @return Value for property 'servers'.
          */
+        @Nonnull
         public List<AccurevServer> getServers() {
             if (this._servers == null) {
                 this._servers = new ArrayList<>();
@@ -794,11 +816,15 @@ public class AccurevSCM extends SCM {
         // keep all transaction types in a set for validation
         private static final String[] VTT_LIST = {"chstream", "defcomp", "mkstream", "promote"};
         private static final Set<String> VALID_TRANSACTION_TYPES = new HashSet<>(Arrays.asList(VTT_LIST));
+        private transient static final String __OBFUSCATE = "OBF:";
         private final String name;
         private final String host;
         private final int port;
-        private final String username;
-        private final String password;
+        @Deprecated
+        public transient String username;
+        @Deprecated
+        public transient String password;
+        private String credentialsId;
         private UUID uuid;
         private String validTransactionTypes;
         private boolean syncOperations;
@@ -814,8 +840,7 @@ public class AccurevSCM extends SCM {
                              String name, //
                              String host, //
                              int port, //
-                             String username, //
-                             String password, //
+                             String credentialsId, //
                              String validTransactionTypes, //
                              boolean syncOperations, //
                              boolean minimiseLogins, //
@@ -828,8 +853,7 @@ public class AccurevSCM extends SCM {
             this.name = name;
             this.host = host;
             this.port = port;
-            this.username = username;
-            this.password = Password.obfuscate(password);
+            this.credentialsId = credentialsId;
             this.validTransactionTypes = validTransactionTypes;
             this.syncOperations = syncOperations;
             this.minimiseLogins = minimiseLogins;
@@ -838,6 +862,32 @@ public class AccurevSCM extends SCM {
             this.useColor = useColor;
             this.usePromoteListen = usePromoteListen;
             AccurevPromoteTrigger.validateListeners();
+        }
+
+        @Deprecated
+        public AccurevServer(String name, String host, int port, String username, String password) {
+            this.uuid = UUID.randomUUID();
+            this.name = name;
+            this.host = host;
+            this.port = port;
+            this.username = username;
+            this.password = password;
+        }
+
+        private static String deobfuscate(String s) {
+            if (s.startsWith(__OBFUSCATE))
+                s = s.substring(__OBFUSCATE.length());
+            if (StringUtils.isEmpty(s)) return "";
+            byte[] b = new byte[s.length() / 2];
+            int l = 0;
+            for (int i = 0; i < s.length(); i += 4) {
+                String x = s.substring(i, i + 4);
+                int i0 = Integer.parseInt(x, 36);
+                int i1 = (i0 / 256);
+                int i2 = (i0 % 256);
+                b[l++] = (byte) ((i1 + i2 - 254) / 2);
+            }
+            return new String(b, 0, l, StandardCharsets.UTF_8);
         }
 
         /**
@@ -895,12 +945,41 @@ public class AccurevSCM extends SCM {
         }
 
         /**
+         * Getter for property 'credentialsId'.
+         *
+         * @return Value for property 'credentialsId'.
+         */
+        public String getCredentialsId() {
+            return credentialsId;
+        }
+
+        /**
+         * Getter for property 'credentials'.
+         *
+         * @return Value for property 'credentials'.
+         */
+        @CheckForNull
+        public StandardUsernamePasswordCredentials getCredentials() {
+            if (StringUtils.isBlank(credentialsId)) return null;
+            else {
+                return CredentialsMatchers.firstOrNull(
+                        CredentialsProvider
+                                .lookupCredentials(StandardUsernamePasswordCredentials.class,
+                                        Jenkins.getInstance(), ACL.SYSTEM,
+                                        URIRequirementBuilder.fromUri("").withHostnamePort(host, port).build()),
+                        CredentialsMatchers.withId(credentialsId)
+                );
+            }
+        }
+
+        /**
          * Getter for property 'username'.
          *
          * @return Value for property 'username'.
          */
         public String getUsername() {
-            return username;
+            StandardUsernamePasswordCredentials credentials = getCredentials();
+            return credentials == null ? "jenkins" : credentials.getUsername();
         }
 
         /**
@@ -909,7 +988,8 @@ public class AccurevSCM extends SCM {
          * @return Value for property 'password'.
          */
         public String getPassword() {
-            return Password.deobfuscate(password); //TODO: Use Credentials plugin
+            StandardUsernamePasswordCredentials credentials = getCredentials();
+            return credentials == null ? "" : Secret.toString(credentials.getPassword());
         }
 
         /**
@@ -989,6 +1069,54 @@ public class AccurevSCM extends SCM {
             return FormValidation.ok();
         }
 
+        public boolean migrateCredentials() {
+            if (username != null) {
+                LOGGER.info("Migrating to credentials");
+                String secret = deobfuscate(password);
+                String credentialsId = "";
+                List<DomainRequirement> domainRequirements = Util.fixNull(URIRequirementBuilder
+                        .fromUri("")
+                        .withHostnamePort(host, port)
+                        .build());
+                List<StandardUsernamePasswordCredentials> credentials = CredentialsMatchers.filter(
+                        CredentialsProvider.lookupCredentials(
+                                StandardUsernamePasswordCredentials.class,
+                                Jenkins.getInstance(), ACL.SYSTEM, domainRequirements),
+                        CredentialsMatchers.withUsername(username)
+                );
+                for (StandardUsernamePasswordCredentials cred : credentials) {
+                    if (StringUtils.equals(secret, Secret.toString(cred.getPassword()))) {
+                        // If some credentials have the same username/password, use those.
+                        credentialsId = cred.getId();
+                        this.credentialsId = credentialsId;
+                        break;
+                    }
+                }
+                if (StringUtils.isBlank(credentialsId)) {
+                    // If we couldn't find any existing credentials,
+                    // create new credentials with the principal and secret and use it.
+                    StandardUsernamePasswordCredentials newCredentials = new UsernamePasswordCredentialsImpl(
+                            CredentialsScope.SYSTEM, null, "Migrated by Accurev Plugin", username, secret);
+                    SystemCredentialsProvider.getInstance().getCredentials().add(newCredentials);
+                    credentialsId = newCredentials.getId();
+                    this.credentialsId = credentialsId;
+                }
+                if (StringUtils.isNotEmpty(this.credentialsId)) {
+                    try {
+                        SystemCredentialsProvider.getInstance().save();
+                        LOGGER.info("Migrated successfully to credentials");
+                        username = null;
+                        password = null;
+                        return true;
+                    } catch (IOException e) {
+                        LOGGER.severe("Failed to save credentials");
+                    }
+                } else {
+                    LOGGER.severe("Migration failed");
+                }
+            }
+            return false;
+        }
     }
 
     // -------------------------- INNER CLASSES --------------------------
